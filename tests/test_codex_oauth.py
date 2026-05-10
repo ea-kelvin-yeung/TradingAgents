@@ -7,6 +7,7 @@ from unittest.mock import patch
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 from pydantic import BaseModel
+from requests.exceptions import ChunkedEncodingError
 
 from tradingagents.llm_clients.codex_oauth import (
     CodexOAuthTokens,
@@ -334,8 +335,11 @@ def test_codex_oauth_post_uses_account_header_and_endpoint():
         def json(self):
             return {"output_text": "ok"}
 
-    def fake_post(url, json, headers, timeout):
-        calls.append(SimpleNamespace(url=url, json=json, headers=headers, timeout=timeout))
+        def close(self):
+            pass
+
+    def fake_post(url, json, headers, timeout, stream):
+        calls.append(SimpleNamespace(url=url, json=json, headers=headers, timeout=timeout, stream=stream))
         return Response()
 
     with (
@@ -352,6 +356,7 @@ def test_codex_oauth_post_uses_account_header_and_endpoint():
     assert calls[0].headers["Authorization"] == "Bearer access"
     assert calls[0].headers["ChatGPT-Account-ID"] == "acct_123"
     assert calls[0].headers["OpenAI-Beta"] == "responses=experimental"
+    assert calls[0].stream is True
 
 
 def test_codex_oauth_post_refreshes_on_401():
@@ -362,6 +367,9 @@ def test_codex_oauth_post_refreshes_on_401():
         text = "expired"
         headers = {"Content-Type": "application/json"}
 
+        def close(self):
+            pass
+
     class Response200:
         status_code = 200
         text = ""
@@ -370,7 +378,10 @@ def test_codex_oauth_post_refreshes_on_401():
         def json(self):
             return {"output_text": "ok"}
 
-    def fake_post(url, json, headers, timeout):
+        def close(self):
+            pass
+
+    def fake_post(url, json, headers, timeout, stream):
         calls.append(headers["Authorization"])
         return Response401() if len(calls) == 1 else Response200()
 
@@ -395,3 +406,55 @@ def test_codex_oauth_post_refreshes_on_401():
 
     assert payload == {"output_text": "ok"}
     assert calls == ["Bearer old", "Bearer new"]
+
+
+def test_codex_oauth_post_retries_truncated_stream_once():
+    calls = 0
+
+    class TruncatedResponse:
+        status_code = 200
+        headers = {"Content-Type": "text/event-stream"}
+
+        def iter_lines(self, decode_unicode=True):
+            raise ChunkedEncodingError("Response ended prematurely")
+
+        def close(self):
+            pass
+
+    class Response200:
+        status_code = 200
+        headers = {"Content-Type": "text/event-stream"}
+
+        def iter_lines(self, decode_unicode=True):
+            return iter([
+                'data: {"type":"response.output_text.delta","delta":"ok"}',
+                "data: [DONE]",
+            ])
+
+        def close(self):
+            pass
+
+    def fake_post(url, json, headers, timeout, stream):
+        nonlocal calls
+        calls += 1
+        assert stream is True
+        return TruncatedResponse() if calls == 1 else Response200()
+
+    with (
+        patch(
+            "tradingagents.llm_clients.codex_oauth_client.get_valid_tokens",
+            return_value=CodexOAuthTokens("access", "refresh", time.time() + 100, "acct_123"),
+        ),
+        patch("tradingagents.llm_clients.codex_oauth_client.requests.post", side_effect=fake_post),
+    ):
+        payload = CodexOAuthChatModel()._post({"input": []})
+
+    assert payload == {
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "ok"}],
+            }
+        ]
+    }
+    assert calls == 2

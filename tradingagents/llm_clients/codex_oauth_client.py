@@ -9,6 +9,7 @@ import uuid
 from typing import Any, Optional
 
 import requests
+from requests.exceptions import ChunkedEncodingError
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
@@ -155,7 +156,8 @@ class CodexOAuthChatModel(BaseChatModel):
         }
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
-        tokens = get_valid_tokens(CodexOAuthStore())
+        store = CodexOAuthStore()
+        tokens = get_valid_tokens(store)
         headers = {
             "Authorization": f"Bearer {tokens.access_token}",
             "Content-Type": "application/json",
@@ -167,40 +169,63 @@ class CodexOAuthChatModel(BaseChatModel):
         if tokens.account_id:
             headers["ChatGPT-Account-ID"] = tokens.account_id
 
-        response = requests.post(
-            f"{self.base_url.rstrip('/')}{CODEX_RESPONSES_PATH}",
-            json=payload,
-            headers=headers,
-            timeout=self.timeout,
-        )
-        if response.status_code == 401:
-            store = CodexOAuthStore()
-            refreshed = refresh_tokens(store.load().refresh_token)
-            store.save(refreshed)
-            headers["Authorization"] = f"Bearer {refreshed.access_token}"
-            if refreshed.account_id:
-                headers["ChatGPT-Account-ID"] = refreshed.account_id
+        endpoint = f"{self.base_url.rstrip('/')}{CODEX_RESPONSES_PATH}"
+        last_stream_error: ChunkedEncodingError | None = None
+        for attempt in range(2):
             response = requests.post(
-                f"{self.base_url.rstrip('/')}{CODEX_RESPONSES_PATH}",
+                endpoint,
                 json=payload,
                 headers=headers,
                 timeout=self.timeout,
+                stream=True,
             )
-        if response.status_code >= 400:
-            raise RuntimeError(f"Codex OAuth request failed: HTTP {response.status_code} {response.text}")
-        return self._decode_response(response)
+            try:
+                if response.status_code == 401:
+                    refreshed = refresh_tokens(store.load().refresh_token)
+                    store.save(refreshed)
+                    headers["Authorization"] = f"Bearer {refreshed.access_token}"
+                    if refreshed.account_id:
+                        headers["ChatGPT-Account-ID"] = refreshed.account_id
+                    response.close()
+                    response = requests.post(
+                        endpoint,
+                        json=payload,
+                        headers=headers,
+                        timeout=self.timeout,
+                        stream=True,
+                    )
+                if response.status_code >= 400:
+                    raise RuntimeError(f"Codex OAuth request failed: HTTP {response.status_code} {response.text}")
+                return self._decode_response(response)
+            except ChunkedEncodingError as exc:
+                last_stream_error = exc
+                if attempt == 1:
+                    break
+            finally:
+                response.close()
+
+        raise RuntimeError("Codex OAuth stream ended before completion after retrying once.") from last_stream_error
 
     def _decode_response(self, response: requests.Response) -> dict[str, Any]:
         content_type = response.headers.get("Content-Type", "")
+        if "text/event-stream" in content_type:
+            if hasattr(response, "iter_lines"):
+                return self._decode_sse_lines(response.iter_lines(decode_unicode=True))
+            return self._decode_sse_lines(response.text.splitlines())
+
         body = response.text
-        looks_like_sse = body.lstrip().startswith(("event:", "data:"))
-        if "text/event-stream" not in content_type and not looks_like_sse:
+        if not body.lstrip().startswith(("event:", "data:")):
             return response.json()
 
+        return self._decode_sse_lines(body.splitlines())
+
+    def _decode_sse_lines(self, lines) -> dict[str, Any]:
         completed: dict[str, Any] | None = None
         text_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
-        for raw_line in body.splitlines():
+        for raw_line in lines:
+            if isinstance(raw_line, bytes):
+                raw_line = raw_line.decode("utf-8", errors="replace")
             line = raw_line.strip()
             if not line.startswith("data:"):
                 continue
